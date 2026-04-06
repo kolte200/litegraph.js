@@ -1180,7 +1180,8 @@
             var num = 0; //num of input connections
             if (node.inputs) {
                 for (var j = 0, l2 = node.inputs.length; j < l2; j++) {
-                    if (node.inputs[j] && node.inputs[j].link != null) {
+                    var slot = node.inputs[j];
+                    if (slot && slot.links && slot.links.length) {
                         num += 1;
                     }
                 }
@@ -1572,7 +1573,7 @@
         if (node.inputs) {
             for (var i = 0; i < node.inputs.length; i++) {
                 var slot = node.inputs[i];
-                if (slot.link != null) {
+                if (slot.links && slot.links.length) {
                     node.disconnectInput(i);
                 }
             }
@@ -2566,9 +2567,21 @@
 		if (this.inputs) {
 			for (var i = 0; i < this.inputs.length; ++i) {
 				var input = this.inputs[i];
-				var link_info = this.graph ? this.graph.links[input.link] : null;
-				if (this.onConnectionsChange)
-					this.onConnectionsChange( LiteGraph.INPUT, i, true, link_info, input ); //link_info has been created now, so its updated
+                // Migration: handle old 'link' field and convert to 'links' array
+                if (input.link !== undefined) {
+                    input.links = input.link === null ? [] : [input.link];
+                    delete input.link;
+                }
+
+                if (input.links) {
+                    for (var j = 0; j < input.links.length; ++j) {
+                        var link_id = input.links[j];
+                        var link_info = this.graph ? this.graph.links[link_id] : null;
+                        if (this.onConnectionsChange) {
+                            this.onConnectionsChange(LiteGraph.INPUT, i, true, link_info, input);
+                        }
+                    }
+                }
 
 				if( this.onInputAdded )
 					this.onInputAdded(input);
@@ -2710,7 +2723,7 @@
         //remove links
         if (data.inputs) {
             for (var i = 0; i < data.inputs.length; ++i) {
-                data.inputs[i].link = null;
+                data.inputs[i].links = [];
             }
         }
 
@@ -2865,34 +2878,35 @@
             return;
         } //undefined;
 
-        if (slot >= this.inputs.length || this.inputs[slot].link == null) {
+        var slot_info = this.inputs[slot];
+        if (!slot_info || !slot_info.links || slot_info.links.length == 0) {
             return;
         }
 
-        var link_id = this.inputs[slot].link;
-        var link = this.graph.links[link_id];
-        if (!link) {
-            //bug: weird case but it happens sometimes
-            return null;
+        var results = [];
+        for (var i = 0; i < slot_info.links.length; ++i) {
+            var link_id = slot_info.links[i];
+            var link = this.graph.links[link_id];
+            if (!link) {
+                continue;
+            }
+
+            if (force_update) {
+                var node = this.graph.getNodeById(link.origin_id);
+                if (node) {
+                    if (node.updateOutputData) {
+                        node.updateOutputData(link.origin_slot);
+                    } else if (node.onExecute) {
+                        node.onExecute();
+                    }
+                }
+            }
+            results.push(link.data);
         }
 
-        if (!force_update) {
-            return link.data;
-        }
-
-        //special case: used to extract data from the incoming connection before the graph has been executed
-        var node = this.graph.getNodeById(link.origin_id);
-        if (!node) {
-            return link.data;
-        }
-
-        if (node.updateOutputData) {
-            node.updateOutputData(link.origin_slot);
-        } else if (node.onExecute) {
-            node.onExecute();
-        }
-
-        return link.data;
+        if (results.length == 0) return;
+        if (results.length == 1) return results[0];
+        return results;
     };
 
     /**
@@ -2906,10 +2920,11 @@
             return null;
         } //undefined;
 
-        if (slot >= this.inputs.length || this.inputs[slot].link == null) {
+        var slot_info = this.inputs[slot];
+        if (!slot_info || !slot_info.links || slot_info.links.length == 0) {
             return null;
         }
-        var link_id = this.inputs[slot].link;
+        var link_id = slot_info.links[0];
         var link = this.graph.links[link_id];
         if (!link) {
             //bug: weird case but it happens sometimes
@@ -2954,7 +2969,7 @@
         if (!this.inputs) {
             return false;
         }
-        return slot < this.inputs.length && this.inputs[slot].link != null;
+        return slot < this.inputs.length && this.inputs[slot].links && this.inputs[slot].links.length > 0;
     };
 
     /**
@@ -2985,7 +3000,7 @@
         }
         if (slot < this.inputs.length) {
             var slot_info = this.inputs[slot];
-			return this.graph.links[ slot_info.link ];
+			return this.graph.links[ (slot_info.links && slot_info.links.length) ? slot_info.links[0] : null ];
         }
         return null;
     };
@@ -3004,10 +3019,10 @@
             return null;
         }
         var input = this.inputs[slot];
-        if (!input || input.link === null) {
+        if (!input || !input.links || input.links.length == 0) {
             return null;
         }
-        var link_info = this.graph.links[input.link];
+        var link_info = this.graph.links[input.links[0]];
         if (!link_info) {
             return null;
         }
@@ -3027,8 +3042,8 @@
 
         for (var i = 0, l = this.inputs.length; i < l; ++i) {
             var input_info = this.inputs[i];
-            if (name == input_info.name && input_info.link != null) {
-                var link = this.graph.links[input_info.link];
+            if (name == input_info.name && input_info.links && input_info.links.length) {
+                var link = this.graph.links[input_info.links[0]];
                 if (link) {
                     return link.data;
                 }
@@ -3566,7 +3581,7 @@
      */
     LGraphNode.prototype.addInput = function(name, type, extra_info) {
         type = type || 0;
-        var input = { name: name, type: type, link: null };
+        var input = { name: name, type: type, links: [] };
         if (extra_info) {
             for (var i in extra_info) {
                 input[i] = extra_info[i];
@@ -3598,7 +3613,7 @@
     LGraphNode.prototype.addInputs = function(array) {
         for (var i = 0; i < array.length; ++i) {
             var info = array[i];
-            var o = { name: info[0], type: info[1], link: null };
+            var o = { name: info[0], type: info[1], links: [] };
             if (array[2]) {
                 for (var j in info[2]) {
                     o[j] = info[2][j];
@@ -3629,14 +3644,16 @@
         this.disconnectInput(slot);
         var slot_info = this.inputs.splice(slot, 1);
         for (var i = slot; i < this.inputs.length; ++i) {
-            if (!this.inputs[i]) {
+            var input = this.inputs[i];
+            if (!input || !input.links) {
                 continue;
             }
-            var link = this.graph.links[this.inputs[i].link];
-            if (!link) {
-                continue;
+            for (var j = 0; j < input.links.length; ++j) {
+                var link = this.graph.links[input.links[j]];
+                if (link) {
+                    link.target_slot -= 1;
+                }
             }
-            link.target_slot -= 1;
         }
         this.setSize( this.computeSize() );
         if (this.onInputRemoved) {
@@ -4063,7 +4080,7 @@
             return -1;
         }
         for (var i = 0, l = this.inputs.length; i < l; ++i) {
-            if (this.inputs[i].link && this.inputs[i].link != null) {
+            if (this.inputs[i].links && this.inputs[i].links.length) {
                 continue;
             }
             if (opts.typesNotAccepted && opts.typesNotAccepted.includes && opts.typesNotAccepted.includes(this.inputs[i].type)){
@@ -4147,7 +4164,7 @@
 					if (aSource[sI]=="*") aSource[sI] = 0;
 					if (aDest[sI]=="*") aDest[sI] = 0;
 					if (aSource[sI] == aDest[dI]) {
-                        if (preferFreeSlot && aSlots[i].links && aSlots[i].links !== null) continue;
+                        if (preferFreeSlot && aSlots[i].links && aSlots[i].links.length) continue;
                         return !returnObj ? i : aSlots[i];
                     }
                 }
@@ -4403,11 +4420,11 @@
         }
 
         //if there is something already plugged there, disconnect
-        if (target_node.inputs[target_slot] && target_node.inputs[target_slot].link != null) {
-			this.graph.beforeChange();
-            target_node.disconnectInput(target_slot, {doProcessChange: false});
-			changed = true;
-        }
+        // if (target_node.inputs[target_slot] && target_node.inputs[target_slot].links && target_node.inputs[target_slot].links.length) {
+		// 	this.graph.beforeChange();
+        //     target_node.disconnectInput(target_slot, {doProcessChange: false});
+		// 	changed = true;
+        // }
         if (output.links !== null && output.links.length){
             switch(output.type){
                 case LiteGraph.EVENT:
@@ -4447,7 +4464,10 @@
 		}
 		output.links.push(link_info.id);
 		//connect in input
-		target_node.inputs[target_slot].link = link_info.id;
+        if (!target_node.inputs[target_slot].links) {
+            target_node.inputs[target_slot].links = [];
+        }
+		target_node.inputs[target_slot].links.push(link_info.id);
 		if (this.graph) {
 			this.graph._version++;
 		}
@@ -4539,7 +4559,11 @@
                 if (link_info.target_id == target_node.id) {
                     output.links.splice(i, 1); //remove here
                     var input = target_node.inputs[link_info.target_slot];
-                    input.link = null; //remove there
+                    if (input.links) {
+                        var idx = input.links.indexOf(link_id);
+                        if (idx != -1) input.links.splice(idx, 1);
+                    }
+
                     delete this.graph.links[link_id]; //remove the link from the links pool
                     if (this.graph) {
                         this.graph._version++;
@@ -4601,7 +4625,11 @@
                 }
                 if (target_node) {
                     input = target_node.inputs[link_info.target_slot];
-                    input.link = null; //remove other side link
+                    if (input.links) {
+                        var idx = input.links.indexOf(link_id);
+                        if (idx != -1) input.links.splice(idx, 1);
+                    }
+
                     if (target_node.onConnectionsChange) {
                         target_node.onConnectionsChange(
                             LiteGraph.INPUT,
@@ -4678,12 +4706,12 @@
             return false;
         }
 
-        var link_id = this.inputs[slot].link;
-		if(link_id != null)
-		{
-			this.inputs[slot].link = null;
+        var input = this.inputs[slot];
+        if (!input || !input.links || input.links.length == 0) return false;
 
-			//remove other side
+        while(input.links.length > 0)
+        {
+            var link_id = input.links.pop();
 			var link_info = this.graph.links[link_id];
 			if (link_info) {
 				var target_node = this.graph.getNodeById(link_info.origin_id);
@@ -4735,7 +4763,7 @@
 					this.graph.onNodeConnectionChange(LiteGraph.INPUT, this, slot);
 				}
 			}
-		} //link != null
+        }
 
         this.setDirtyCanvas(false, true);
 		if(this.graph)
@@ -8672,7 +8700,7 @@ LGraphNode.prototype.executeAction = function(action)
                     }
 
                     ctx.fillStyle =
-                        slot.link != null
+                        (slot.links && slot.links.length)
                             ? slot.color_on ||
                               this.default_connection_color_byType[slot_type] ||
                               this.default_connection_color.input_on
@@ -9382,11 +9410,12 @@ LGraphNode.prototype.executeAction = function(action)
 
             for (var i = 0; i < node.inputs.length; ++i) {
                 var input = node.inputs[i];
-                if (!input || input.link == null) {
+                if (!input || !input.links || input.links.length == 0) {
                     continue;
                 }
-                var link_id = input.link;
-                var link = this.graph.links[link_id];
+                for (var j = 0; j < input.links.length; ++j) {
+                    var link_id = input.links[j];
+                    var link = this.graph.links[link_id];
                 if (!link) {
                     continue;
                 }
@@ -9473,6 +9502,7 @@ LGraphNode.prototype.executeAction = function(action)
                     );
                     ctx.globalAlpha = tmp;
                 }
+            }
             }
         }
         ctx.globalAlpha = 1;
@@ -14421,4 +14451,3 @@ if (typeof exports != "undefined") {
     exports.LGraphCanvas = this.LGraphCanvas;
     exports.ContextMenu = this.ContextMenu;
 }
-
