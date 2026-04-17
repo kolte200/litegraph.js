@@ -7005,8 +7005,14 @@ LGraphNode.prototype.executeAction = function(action)
                 );
 
                 if (!node && e.click_time < 300) {
-                    this.deselectAllNodes();
-                    this.deselectAllGroups();
+                    //only clear the selection when the click landed in empty
+                    //space — clicking on a group must keep it selected so
+                    //Delete/Copy work on it
+                    var group = this.graph.getGroupOnPos(e.canvasX, e.canvasY);
+                    if (!group) {
+                        this.deselectAllNodes();
+                        this.deselectAllGroups();
+                    }
                 }
 
                 this.dirty_canvas = true;
