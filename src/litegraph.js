@@ -7280,7 +7280,10 @@ LGraphNode.prototype.executeAction = function(action)
             }
 
             //undo (Ctrl+Z) / redo (Ctrl+Shift+Z or Ctrl+Y)
-            if (e.keyCode === 90 && (e.metaKey || e.ctrlKey)) {
+            //use e.key so the shortcut tracks the layout (AZERTY's Z sits on
+            //the physical W-position, so e.keyCode would be 87 there, not 90)
+            var ek = e.key ? e.key.toLowerCase() : "";
+            if (ek === "z" && (e.metaKey || e.ctrlKey)) {
                 if (
                     e.target.localName != "input" &&
                     e.target.localName != "textarea"
@@ -7289,7 +7292,7 @@ LGraphNode.prototype.executeAction = function(action)
                     block_default = true;
                 }
             }
-            if (e.keyCode === 89 && (e.metaKey || e.ctrlKey)) {
+            if (ek === "y" && (e.metaKey || e.ctrlKey)) {
                 if (
                     e.target.localName != "input" &&
                     e.target.localName != "textarea"
