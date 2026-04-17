@@ -5522,6 +5522,12 @@ LGraphNode.prototype.executeAction = function(action)
         this.selected_group = null;
         this.selected_groups = new Set(); //groups selected via rectangle/ctrl+drag
 
+        //undo/redo stacks, driven by graph.onBeforeChange
+        this._undo_stack = [];
+        this._redo_stack = [];
+        this._max_undo_stack = 50;
+        this._suppress_undo = false;
+
         this.visible_nodes = [];
         this.node_dragged = null;
         this.node_over = null;
@@ -7261,6 +7267,38 @@ LGraphNode.prototype.executeAction = function(action)
                 this.pasteFromClipboard(e.shiftKey);
             }
 
+            //cut (Ctrl+X) — copy then delete
+            if (e.keyCode === 88 && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
+                if (
+                    e.target.localName != "input" &&
+                    e.target.localName != "textarea"
+                ) {
+                    this.copyToClipboard();
+                    this.deleteSelectedNodes();
+                    block_default = true;
+                }
+            }
+
+            //undo (Ctrl+Z) / redo (Ctrl+Shift+Z or Ctrl+Y)
+            if (e.keyCode === 90 && (e.metaKey || e.ctrlKey)) {
+                if (
+                    e.target.localName != "input" &&
+                    e.target.localName != "textarea"
+                ) {
+                    if (e.shiftKey) this.redo(); else this.undo();
+                    block_default = true;
+                }
+            }
+            if (e.keyCode === 89 && (e.metaKey || e.ctrlKey)) {
+                if (
+                    e.target.localName != "input" &&
+                    e.target.localName != "textarea"
+                ) {
+                    this.redo();
+                    block_default = true;
+                }
+            }
+
             //delete or backspace
             if (e.keyCode == 46 || e.keyCode == 8) {
                 if (
@@ -7806,7 +7844,65 @@ LGraphNode.prototype.executeAction = function(action)
         this.setDirty(true);
 		this.graph.afterChange();
     };
-    
+
+    /**
+     * undo/redo — the graph.beforeChange() hook is already called at every
+     * mutating site (add, remove, connect, disconnect, paste, delete,
+     * drag-end...), we just serialize the graph into a stack on each call
+     * and restore it on demand.
+     **/
+    LGraphCanvas.prototype.saveSnapshot = function() {
+        if (!this.graph || this._suppress_undo) return;
+        //A logical operation (delete N nodes, paste M nodes, drag group...)
+        //may trigger beforeChange many times in rapid succession. Collapse
+        //bursts within 200ms into a single undoable step by keeping only
+        //the earliest snapshot of the burst (the true pre-state).
+        var now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+        if (this._last_snapshot_time && now - this._last_snapshot_time < 200) {
+            this._last_snapshot_time = now;
+            return;
+        }
+        this._last_snapshot_time = now;
+        this._undo_stack.push(JSON.stringify(this.graph.serialize()));
+        if (this._undo_stack.length > this._max_undo_stack) {
+            this._undo_stack.shift();
+        }
+        this._redo_stack.length = 0;
+    };
+
+    LGraphCanvas.prototype.onBeforeChange = function(graph) {
+        this.saveSnapshot();
+    };
+
+    LGraphCanvas.prototype._restoreSnapshot = function(data) {
+        this._suppress_undo = true;
+        try {
+            this.graph.configure(data, false);
+        } finally {
+            this._suppress_undo = false;
+        }
+        //references to old nodes/groups are stale after configure
+        this.selected_nodes = {};
+        this.selected_group = null;
+        this.selected_groups.clear();
+        this.highlighted_links = {};
+        //reset the debounce window so the very next mutation snapshots cleanly
+        this._last_snapshot_time = 0;
+        this.setDirty(true, true);
+    };
+
+    LGraphCanvas.prototype.undo = function() {
+        if (!this._undo_stack.length || !this.graph) return;
+        this._redo_stack.push(JSON.stringify(this.graph.serialize()));
+        this._restoreSnapshot(JSON.parse(this._undo_stack.pop()));
+    };
+
+    LGraphCanvas.prototype.redo = function() {
+        if (!this._redo_stack.length || !this.graph) return;
+        this._undo_stack.push(JSON.stringify(this.graph.serialize()));
+        this._restoreSnapshot(JSON.parse(this._redo_stack.pop()));
+    };
+
     /**
      * centers the camera on a given node
      * @method centerOnNode
