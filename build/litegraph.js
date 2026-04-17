@@ -5461,7 +5461,10 @@ LGraphNode.prototype.executeAction = function(action)
 		this.onNodeMoved = null; //called after moving a node
 		this.onSelectionChange = null; //called if the selection changes
 		this.onConnectingChange = null; //called before any link changes
-		this.onBeforeChange = null; //called before modifying the graph
+		//wired by default to saveSnapshot so Ctrl+Z works out-of-the-box.
+		//sendActionToCanvas calls c[action] directly on the instance, so the
+		//prototype method was shadowed by an explicit 'null' assignment here.
+		this.onBeforeChange = this.saveSnapshot.bind(this);
 		this.onAfterChange = null; //called after modifying the graph
 
         this.connections_width = 3;
@@ -7871,10 +7874,6 @@ LGraphNode.prototype.executeAction = function(action)
             this._undo_stack.shift();
         }
         this._redo_stack.length = 0;
-    };
-
-    LGraphCanvas.prototype.onBeforeChange = function(graph) {
-        this.saveSnapshot();
     };
 
     LGraphCanvas.prototype._restoreSnapshot = function(data) {
