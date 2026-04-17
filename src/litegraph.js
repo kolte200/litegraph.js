@@ -6320,6 +6320,13 @@ LGraphNode.prototype.executeAction = function(action)
 						} else {
 							this.selected_group.recomputeInsideNodes();
 						}
+
+						//promote this group into the multi-selection model so
+						//Delete / Copy / Paste pick it up like any other item
+						if (!e.shiftKey && !e.ctrlKey) {
+							this.deselectAllNodes();
+						}
+						this.selectGroups([this.selected_group], e.shiftKey || e.ctrlKey);
 					}
 
 					if (is_double_click && !this.read_only && this.allow_searchbox) {
@@ -7572,7 +7579,11 @@ LGraphNode.prototype.executeAction = function(action)
     };
 
     LGraphCanvas.prototype.processNodeSelected = function(node, e) {
-        this.selectNode(node, e && (e.shiftKey || e.ctrlKey || this.multi_select));
+        var add = !!(e && (e.shiftKey || e.ctrlKey || this.multi_select));
+        //clicking a node plainly (no modifier) should also drop any
+        //previously-selected groups, so selection stays mutually exclusive
+        if (!add) this.deselectAllGroups();
+        this.selectNode(node, add);
         if (this.onNodeSelected) {
             this.onNodeSelected(node);
         }
