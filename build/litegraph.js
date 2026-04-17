@@ -7303,26 +7303,28 @@ LGraphNode.prototype.executeAction = function(action)
             if (node.inputs && node.inputs.length) {
                 for (var j = 0; j < node.inputs.length; ++j) {
                     var input = node.inputs[j];
-                    if (!input || input.link == null) {
+                    //this fork supports multiple incoming links per input, so
+                    //iterate input.links rather than the legacy scalar input.link
+                    if (!input || !input.links || input.links.length === 0) {
                         continue;
                     }
-                    var link_info = this.graph.links[input.link];
-                    if (!link_info) {
-                        continue;
+                    for (var k = 0; k < input.links.length; ++k) {
+                        var link_info = this.graph.links[input.links[k]];
+                        if (!link_info) {
+                            continue;
+                        }
+                        var origin_node = this.graph.getNodeById(link_info.origin_id);
+                        if (!origin_node) {
+                            continue;
+                        }
+                        clipboard_info.links.push([
+                            origin_node._relative_id,
+                            link_info.origin_slot,
+                            node._relative_id,
+                            link_info.target_slot,
+                            origin_node.id
+                        ]);
                     }
-                    var target_node = this.graph.getNodeById(
-                        link_info.origin_id
-                    );
-                    if (!target_node) {
-                        continue;
-                    }
-                    clipboard_info.links.push([
-                        target_node._relative_id,
-                        link_info.origin_slot,
-                        node._relative_id,
-                        link_info.target_slot,
-                        target_node.id
-                    ]);
                 }
             }
         }
