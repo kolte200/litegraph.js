@@ -5031,6 +5031,7 @@ LGraphNode.prototype.executeAction = function(action)
         this._pos = this._bounding.subarray(0, 2);
         this._size = this._bounding.subarray(2, 4);
         this._nodes = [];
+        this._groups = []; //child groups strictly contained in this one
         this.graph = null;
 
         Object.defineProperty(this, "pos", {
@@ -5095,10 +5096,19 @@ LGraphNode.prototype.executeAction = function(action)
             node.pos[0] += deltax;
             node.pos[1] += deltay;
         }
+        //cascade to child groups. Pass ignore_nodes=true: any node inside a
+        //child group also overlaps this group's bounding and was already
+        //moved above, so re-moving via child.move would double-translate.
+        if (this._groups) {
+            for (var i = 0; i < this._groups.length; ++i) {
+                this._groups[i].move(deltax, deltay, true);
+            }
+        }
     };
 
     LGraphGroup.prototype.recomputeInsideNodes = function() {
         this._nodes.length = 0;
+        this._groups.length = 0;
         var nodes = this.graph._nodes;
         var node_bounding = new Float32Array(4);
 
@@ -5107,8 +5117,17 @@ LGraphNode.prototype.executeAction = function(action)
             node.getBounding(node_bounding);
             if (!overlapBounding(this._bounding, node_bounding)) {
                 continue;
-            } //out of the visible area
+            }
             this._nodes.push(node);
+        }
+
+        //also track strictly-contained child groups so move() can cascade
+        var groups = this.graph._groups;
+        for (var i = 0; i < groups.length; ++i) {
+            var other = groups[i];
+            if (other === this) continue;
+            if (!containsBounding(this._bounding, other._bounding)) continue;
+            this._groups.push(other);
         }
     };
 
@@ -13738,6 +13757,15 @@ LGraphNode.prototype.executeAction = function(action)
         return true;
     }
     LiteGraph.overlapBounding = overlapBounding;
+
+    //is 'inner' strictly contained in 'outer', format: [ startx, starty, width, height ]
+    function containsBounding(outer, inner) {
+        return outer[0] <= inner[0]
+            && outer[1] <= inner[1]
+            && outer[0] + outer[2] >= inner[0] + inner[2]
+            && outer[1] + outer[3] >= inner[1] + inner[3];
+    }
+    LiteGraph.containsBounding = containsBounding;
 
     //Convert a hex value to its decimal value - the inputted hex must be in the
     //	format of a hex triplet - the kind we use for HTML colours. The function
