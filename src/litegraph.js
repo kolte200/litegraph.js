@@ -5501,6 +5501,7 @@ LGraphNode.prototype.executeAction = function(action)
 
         this.selected_nodes = {};
         this.selected_group = null;
+        this.selected_groups = new Set(); //groups selected via rectangle/ctrl+drag
 
         this.visible_nodes = [];
         this.node_dragged = null;
@@ -5613,6 +5614,7 @@ LGraphNode.prototype.executeAction = function(action)
         var subgraph_node = this.graph._subgraph_node;
         var graph = this._graph_stack.pop();
         this.selected_nodes = {};
+        this.selected_groups = new Set();
         this.highlighted_links = {};
         graph.attachCanvas(this);
         this.setDirty(true, true);
@@ -6827,9 +6829,23 @@ LGraphNode.prototype.executeAction = function(action)
 							} //out of the visible area
 							to_select.push(nodeX);
 						}
-						if (to_select.length) {
-							this.selectNodes(to_select,e.shiftKey); // add to selection with shift
+						//also collect groups whose bounding overlaps the rectangle
+						var groups = this.graph._groups;
+						var to_select_groups = [];
+						for (var i = 0; i < groups.length; ++i) {
+							var groupX = groups[i];
+							if (
+								!overlapBounding(
+									this.dragging_rectangle,
+									groupX._bounding
+								)
+							) {
+								continue;
+							}
+							to_select_groups.push(groupX);
 						}
+						this.selectNodes(to_select, e.shiftKey); // add to selection with shift
+						this.selectGroups(to_select_groups, e.shiftKey);
 					}else{
 						// will select of update selection
 						this.selectNodes([node],e.shiftKey||e.ctrlKey); // add to selection add to selection with ctrlKey or shiftKey
@@ -6964,6 +6980,7 @@ LGraphNode.prototype.executeAction = function(action)
 
                 if (!node && e.click_time < 300) {
                     this.deselectAllNodes();
+                    this.deselectAllGroups();
                 }
 
                 this.dirty_canvas = true;
@@ -7195,6 +7212,7 @@ LGraphNode.prototype.executeAction = function(action)
             //select all Control A
             if (e.keyCode == 65 && e.ctrlKey) {
                 this.selectNodes();
+                this.selectGroups(this.graph._groups);
                 block_default = true;
             }
 
@@ -7260,7 +7278,8 @@ LGraphNode.prototype.executeAction = function(action)
     LGraphCanvas.prototype.copyToClipboard = function() {
         var clipboard_info = {
             nodes: [],
-            links: []
+            links: [],
+            groups: []
         };
         var index = 0;
         var selected_nodes_array = [];
@@ -7275,12 +7294,9 @@ LGraphNode.prototype.executeAction = function(action)
 
         for (var i = 0; i < selected_nodes_array.length; ++i) {
             var node = selected_nodes_array[i];
-            if(node.clonable === false)
-                continue;
             var cloned = node.clone();
-            if(!cloned)
-            {
-                console.warn("node type not found: " + node.type );
+            if (!cloned) {
+                console.warn("node type not found: " + node.type);
                 continue;
             }
             clipboard_info.nodes.push(cloned.serialize());
@@ -7302,7 +7318,7 @@ LGraphNode.prototype.executeAction = function(action)
                     }
                     clipboard_info.links.push([
                         target_node._relative_id,
-                        link_info.origin_slot, //j,
+                        link_info.origin_slot,
                         node._relative_id,
                         link_info.target_slot,
                         target_node.id
@@ -7310,6 +7326,11 @@ LGraphNode.prototype.executeAction = function(action)
                 }
             }
         }
+
+        this.selected_groups.forEach(function(group) {
+            clipboard_info.groups.push(group.serialize());
+        });
+
         localStorage.setItem(
             "litegrapheditor_clipboard",
             JSON.stringify(clipboard_info)
@@ -7330,38 +7351,40 @@ LGraphNode.prototype.executeAction = function(action)
 
         //create nodes
         var clipboard_info = JSON.parse(data);
-        // calculate top-left node, could work without this processing but using diff with last node pos :: clipboard_info.nodes[clipboard_info.nodes.length-1].pos
+        var groups_info = clipboard_info.groups || [];
+
+        //compute top-left of the pasted block (nodes + groups) so every item
+        //keeps its relative layout once anchored at the mouse position
         var posMin = false;
-        var posMinIndexes = false;
+        var updatePosMin = function(x, y) {
+            if (!posMin) {
+                posMin = [x, y];
+            } else {
+                if (posMin[0] > x) posMin[0] = x;
+                if (posMin[1] > y) posMin[1] = y;
+            }
+        };
         for (var i = 0; i < clipboard_info.nodes.length; ++i) {
-            if (posMin){
-                if(posMin[0]>clipboard_info.nodes[i].pos[0]){
-                    posMin[0] = clipboard_info.nodes[i].pos[0];
-                    posMinIndexes[0] = i;
-                }
-                if(posMin[1]>clipboard_info.nodes[i].pos[1]){
-                    posMin[1] = clipboard_info.nodes[i].pos[1];
-                    posMinIndexes[1] = i;
-                }
-            }
-            else{
-                posMin = [clipboard_info.nodes[i].pos[0], clipboard_info.nodes[i].pos[1]];
-                posMinIndexes = [i, i];
-            }
+            updatePosMin(clipboard_info.nodes[i].pos[0], clipboard_info.nodes[i].pos[1]);
         }
+        for (var i = 0; i < groups_info.length; ++i) {
+            updatePosMin(groups_info[i].bounding[0], groups_info[i].bounding[1]);
+        }
+        if (!posMin) posMin = [this.graph_mouse[0], this.graph_mouse[1]];
+
+        var offsetX = this.graph_mouse[0] - posMin[0];
+        var offsetY = this.graph_mouse[1] - posMin[1];
+
         var nodes = [];
         for (var i = 0; i < clipboard_info.nodes.length; ++i) {
             var node_data = clipboard_info.nodes[i];
             var node = LiteGraph.createNode(node_data.type);
             if (node) {
                 node.configure(node_data);
-        
-				//paste in last known mouse position
-                node.pos[0] += this.graph_mouse[0] - posMin[0]; //+= 5;
-                node.pos[1] += this.graph_mouse[1] - posMin[1]; //+= 5;
-
-                this.graph.add(node,{doProcessChange:false});
-                
+                //paste in last known mouse position
+                node.pos[0] += offsetX;
+                node.pos[1] += offsetY;
+                this.graph.add(node, {doProcessChange: false});
                 nodes.push(node);
             }
         }
@@ -7386,7 +7409,28 @@ LGraphNode.prototype.executeAction = function(action)
 				console.warn("Warning, nodes missing on pasting");
         }
 
+        //create groups (offset their bounding like nodes)
+        var groups = [];
+        for (var i = 0; i < groups_info.length; ++i) {
+            var group_data = groups_info[i];
+            var group = new LiteGraph.LGraphGroup();
+            group.configure({
+                title: group_data.title,
+                bounding: [
+                    group_data.bounding[0] + offsetX,
+                    group_data.bounding[1] + offsetY,
+                    group_data.bounding[2],
+                    group_data.bounding[3]
+                ],
+                color: group_data.color,
+                font_size: group_data.font_size
+            });
+            this.graph.add(group);
+            groups.push(group);
+        }
+
         this.selectNodes(nodes);
+        this.selectGroups(groups);
 
 		this.graph.afterChange();
     };
@@ -7642,6 +7686,50 @@ LGraphNode.prototype.executeAction = function(action)
     };
 
     /**
+     * selects several groups (or adds them to the current selection)
+     * Mirrors selectNodes so that rectangle selection can grab groups too,
+     * which is required for copy/paste of full groups-with-nodes blocks.
+     * @method selectGroups
+     **/
+    LGraphCanvas.prototype.selectGroups = function(groups, add_to_current_selection) {
+        if (!add_to_current_selection) {
+            this.deselectAllGroups();
+        }
+        if (!groups) return;
+        for (var i = 0; i < groups.length; ++i) {
+            var group = groups[i];
+            if (this.selected_groups.has(group)) {
+                this.deselectGroup(group);
+                continue;
+            }
+            group.is_selected = true;
+            this.selected_groups.add(group);
+        }
+        this.setDirty(true, true);
+    };
+
+    /**
+     * removes a group from the current selection
+     * @method deselectGroup
+     **/
+    LGraphCanvas.prototype.deselectGroup = function(group) {
+        if (!this.selected_groups.has(group)) return;
+        group.is_selected = false;
+        this.selected_groups.delete(group);
+    };
+
+    /**
+     * removes all groups from the current selection
+     * @method deselectAllGroups
+     **/
+    LGraphCanvas.prototype.deselectAllGroups = function() {
+        if (!this.graph) return;
+        this.selected_groups.forEach(function(g) { g.is_selected = false; });
+        this.selected_groups.clear();
+        this.setDirty(true, true);
+    };
+
+    /**
      * deletes all nodes in the current selection from the graph
      * @method deleteSelectedNodes
      **/
@@ -7670,6 +7758,10 @@ LGraphNode.prototype.executeAction = function(action)
 				this.onNodeDeselected(node);
 			}
         }
+        this.selected_groups.forEach(function(group) {
+            this.graph.remove(group);
+        }, this);
+        this.selected_groups.clear();
         this.selected_nodes = {};
         this.current_node = null;
         this.highlighted_links = {};
@@ -10361,6 +10453,16 @@ LGraphNode.prototype.executeAction = function(action)
             ctx.font = font_size + "px Arial";
 			ctx.textAlign = "left";
             ctx.fillText(group.title, pos[0] + 4, pos[1] + font_size);
+
+            if (group.is_selected) {
+                ctx.save();
+                ctx.globalAlpha = this.editor_alpha;
+                ctx.strokeStyle = "#FFF";
+                ctx.lineWidth = 2;
+                ctx.setLineDash([6, 4]);
+                ctx.strokeRect(pos[0] + 0.5, pos[1] + 0.5, size[0], size[1]);
+                ctx.restore();
+            }
         }
 
         ctx.restore();
