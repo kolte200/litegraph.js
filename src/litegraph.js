@@ -6281,7 +6281,23 @@ LGraphNode.prototype.executeAction = function(action)
 							this.graph.beforeChange();
                             this.node_dragged = node;
                         }
-                        this.processNodeSelected(node, e);
+                        //sticky multi-selection: plainly clicking a node
+                        //already part of a multi-selection would otherwise
+                        //clear the other nodes (processNodeSelected without
+                        //modifier => deselectAllNodes), breaking group drag.
+                        //Defer the selection change to mouseUp and only apply
+                        //it if the node did not actually move (plain click).
+                        var has_modifier = e.shiftKey || e.ctrlKey || this.multi_select;
+                        var selected_count = 0;
+                        for (var _sid in this.selected_nodes) { selected_count++; if (selected_count > 1) break; }
+                        var in_multi_selection = node.is_selected && selected_count > 1;
+                        if (in_multi_selection && !has_modifier) {
+                            this._pending_select_single = node;
+                            this._pending_select_single_pos = [node.pos[0], node.pos[1]];
+                        } else {
+                            this._pending_select_single = null;
+                            this.processNodeSelected(node, e);
+                        }
                     } else { // double-click
                         /**
                          * Don't call the function if the block is already selected.
@@ -7003,6 +7019,21 @@ LGraphNode.prototype.executeAction = function(action)
 				if( this.onNodeMoved )
 					this.onNodeMoved( this.node_dragged );
 				this.graph.afterChange(this.node_dragged);
+                //resolve sticky multi-selection: if the user did a plain
+                //click on a node already part of the selection and didn't
+                //actually drag it, collapse the selection to just that node
+                //(standard click-to-select behaviour). If the node moved,
+                //the multi-selection has been preserved for the group drag.
+                if (this._pending_select_single === this.node_dragged) {
+                    var moved = !this._pending_select_single_pos
+                        || this.node_dragged.pos[0] !== this._pending_select_single_pos[0]
+                        || this.node_dragged.pos[1] !== this._pending_select_single_pos[1];
+                    if (!moved) {
+                        this.processNodeSelected(this.node_dragged, e);
+                    }
+                }
+                this._pending_select_single = null;
+                this._pending_select_single_pos = null;
                 this.node_dragged = null;
             } //no node being dragged
             else {
