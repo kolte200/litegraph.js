@@ -5031,6 +5031,7 @@ LGraphNode.prototype.executeAction = function(action)
         this._pos = this._bounding.subarray(0, 2);
         this._size = this._bounding.subarray(2, 4);
         this._nodes = [];
+        this._groups = []; //child groups strictly contained in this one
         this.graph = null;
 
         Object.defineProperty(this, "pos", {
@@ -5095,10 +5096,19 @@ LGraphNode.prototype.executeAction = function(action)
             node.pos[0] += deltax;
             node.pos[1] += deltay;
         }
+        //cascade to child groups. Pass ignore_nodes=true: any node inside a
+        //child group also overlaps this group's bounding and was already
+        //moved above, so re-moving via child.move would double-translate.
+        if (this._groups) {
+            for (var i = 0; i < this._groups.length; ++i) {
+                this._groups[i].move(deltax, deltay, true);
+            }
+        }
     };
 
     LGraphGroup.prototype.recomputeInsideNodes = function() {
         this._nodes.length = 0;
+        this._groups.length = 0;
         var nodes = this.graph._nodes;
         var node_bounding = new Float32Array(4);
 
@@ -5107,8 +5117,17 @@ LGraphNode.prototype.executeAction = function(action)
             node.getBounding(node_bounding);
             if (!overlapBounding(this._bounding, node_bounding)) {
                 continue;
-            } //out of the visible area
+            }
             this._nodes.push(node);
+        }
+
+        //also track strictly-contained child groups so move() can cascade
+        var groups = this.graph._groups;
+        for (var i = 0; i < groups.length; ++i) {
+            var other = groups[i];
+            if (other === this) continue;
+            if (!containsBounding(this._bounding, other._bounding)) continue;
+            this._groups.push(other);
         }
     };
 
@@ -5442,7 +5461,10 @@ LGraphNode.prototype.executeAction = function(action)
 		this.onNodeMoved = null; //called after moving a node
 		this.onSelectionChange = null; //called if the selection changes
 		this.onConnectingChange = null; //called before any link changes
-		this.onBeforeChange = null; //called before modifying the graph
+		//wired by default to saveSnapshot so Ctrl+Z works out-of-the-box.
+		//sendActionToCanvas calls c[action] directly on the instance, so the
+		//prototype method was shadowed by an explicit 'null' assignment here.
+		this.onBeforeChange = this.saveSnapshot.bind(this);
 		this.onAfterChange = null; //called after modifying the graph
 
         this.connections_width = 3;
@@ -5501,6 +5523,13 @@ LGraphNode.prototype.executeAction = function(action)
 
         this.selected_nodes = {};
         this.selected_group = null;
+        this.selected_groups = new Set(); //groups selected via rectangle/ctrl+drag
+
+        //undo/redo stacks, driven by graph.onBeforeChange
+        this._undo_stack = [];
+        this._redo_stack = [];
+        this._max_undo_stack = 50;
+        this._suppress_undo = false;
 
         this.visible_nodes = [];
         this.node_dragged = null;
@@ -5613,6 +5642,7 @@ LGraphNode.prototype.executeAction = function(action)
         var subgraph_node = this.graph._subgraph_node;
         var graph = this._graph_stack.pop();
         this.selected_nodes = {};
+        this.selected_groups = new Set();
         this.highlighted_links = {};
         graph.attachCanvas(this);
         this.setDirty(true, true);
@@ -6251,7 +6281,23 @@ LGraphNode.prototype.executeAction = function(action)
 							this.graph.beforeChange();
                             this.node_dragged = node;
                         }
-                        this.processNodeSelected(node, e);
+                        //sticky multi-selection: plainly clicking a node
+                        //already part of a multi-selection would otherwise
+                        //clear the other nodes (processNodeSelected without
+                        //modifier => deselectAllNodes), breaking group drag.
+                        //Defer the selection change to mouseUp and only apply
+                        //it if the node did not actually move (plain click).
+                        var has_modifier = e.shiftKey || e.ctrlKey || this.multi_select;
+                        var selected_count = 0;
+                        for (var _sid in this.selected_nodes) { selected_count++; if (selected_count > 1) break; }
+                        var in_multi_selection = node.is_selected && selected_count > 1;
+                        if (in_multi_selection && !has_modifier) {
+                            this._pending_select_single = node;
+                            this._pending_select_single_pos = [node.pos[0], node.pos[1]];
+                        } else {
+                            this._pending_select_single = null;
+                            this.processNodeSelected(node, e);
+                        }
                     } else { // double-click
                         /**
                          * Don't call the function if the block is already selected.
@@ -6299,6 +6345,13 @@ LGraphNode.prototype.executeAction = function(action)
 						} else {
 							this.selected_group.recomputeInsideNodes();
 						}
+
+						//promote this group into the multi-selection model so
+						//Delete / Copy / Paste pick it up like any other item
+						if (!e.shiftKey && !e.ctrlKey) {
+							this.deselectAllNodes();
+						}
+						this.selectGroups([this.selected_group], e.shiftKey || e.ctrlKey);
 					}
 
 					if (is_double_click && !this.read_only && this.allow_searchbox) {
@@ -6827,9 +6880,23 @@ LGraphNode.prototype.executeAction = function(action)
 							} //out of the visible area
 							to_select.push(nodeX);
 						}
-						if (to_select.length) {
-							this.selectNodes(to_select,e.shiftKey); // add to selection with shift
+						//also collect groups whose bounding overlaps the rectangle
+						var groups = this.graph._groups;
+						var to_select_groups = [];
+						for (var i = 0; i < groups.length; ++i) {
+							var groupX = groups[i];
+							if (
+								!overlapBounding(
+									this.dragging_rectangle,
+									groupX._bounding
+								)
+							) {
+								continue;
+							}
+							to_select_groups.push(groupX);
 						}
+						this.selectNodes(to_select, e.shiftKey); // add to selection with shift
+						this.selectGroups(to_select_groups, e.shiftKey);
 					}else{
 						// will select of update selection
 						this.selectNodes([node],e.shiftKey||e.ctrlKey); // add to selection add to selection with ctrlKey or shiftKey
@@ -6952,6 +7019,21 @@ LGraphNode.prototype.executeAction = function(action)
 				if( this.onNodeMoved )
 					this.onNodeMoved( this.node_dragged );
 				this.graph.afterChange(this.node_dragged);
+                //resolve sticky multi-selection: if the user did a plain
+                //click on a node already part of the selection and didn't
+                //actually drag it, collapse the selection to just that node
+                //(standard click-to-select behaviour). If the node moved,
+                //the multi-selection has been preserved for the group drag.
+                if (this._pending_select_single === this.node_dragged) {
+                    var moved = !this._pending_select_single_pos
+                        || this.node_dragged.pos[0] !== this._pending_select_single_pos[0]
+                        || this.node_dragged.pos[1] !== this._pending_select_single_pos[1];
+                    if (!moved) {
+                        this.processNodeSelected(this.node_dragged, e);
+                    }
+                }
+                this._pending_select_single = null;
+                this._pending_select_single_pos = null;
                 this.node_dragged = null;
             } //no node being dragged
             else {
@@ -6963,7 +7045,14 @@ LGraphNode.prototype.executeAction = function(action)
                 );
 
                 if (!node && e.click_time < 300) {
-                    this.deselectAllNodes();
+                    //only clear the selection when the click landed in empty
+                    //space — clicking on a group must keep it selected so
+                    //Delete/Copy work on it
+                    var group = this.graph.getGroupOnPos(e.canvasX, e.canvasY);
+                    if (!group) {
+                        this.deselectAllNodes();
+                        this.deselectAllGroups();
+                    }
                 }
 
                 this.dirty_canvas = true;
@@ -7195,6 +7284,7 @@ LGraphNode.prototype.executeAction = function(action)
             //select all Control A
             if (e.keyCode == 65 && e.ctrlKey) {
                 this.selectNodes();
+                this.selectGroups(this.graph._groups);
                 block_default = true;
             }
 
@@ -7209,6 +7299,41 @@ LGraphNode.prototype.executeAction = function(action)
             if ((e.keyCode === 86) && (e.metaKey || e.ctrlKey)) {
                 //paste
                 this.pasteFromClipboard(e.shiftKey);
+            }
+
+            //cut (Ctrl+X) — copy then delete
+            if (e.keyCode === 88 && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
+                if (
+                    e.target.localName != "input" &&
+                    e.target.localName != "textarea"
+                ) {
+                    this.copyToClipboard();
+                    this.deleteSelectedNodes();
+                    block_default = true;
+                }
+            }
+
+            //undo (Ctrl+Z) / redo (Ctrl+Shift+Z or Ctrl+Y)
+            //use e.key so the shortcut tracks the layout (AZERTY's Z sits on
+            //the physical W-position, so e.keyCode would be 87 there, not 90)
+            var ek = e.key ? e.key.toLowerCase() : "";
+            if (ek === "z" && (e.metaKey || e.ctrlKey)) {
+                if (
+                    e.target.localName != "input" &&
+                    e.target.localName != "textarea"
+                ) {
+                    if (e.shiftKey) this.redo(); else this.undo();
+                    block_default = true;
+                }
+            }
+            if (ek === "y" && (e.metaKey || e.ctrlKey)) {
+                if (
+                    e.target.localName != "input" &&
+                    e.target.localName != "textarea"
+                ) {
+                    this.redo();
+                    block_default = true;
+                }
             }
 
             //delete or backspace
@@ -7260,7 +7385,8 @@ LGraphNode.prototype.executeAction = function(action)
     LGraphCanvas.prototype.copyToClipboard = function() {
         var clipboard_info = {
             nodes: [],
-            links: []
+            links: [],
+            groups: []
         };
         var index = 0;
         var selected_nodes_array = [];
@@ -7275,41 +7401,45 @@ LGraphNode.prototype.executeAction = function(action)
 
         for (var i = 0; i < selected_nodes_array.length; ++i) {
             var node = selected_nodes_array[i];
-            if(node.clonable === false)
-                continue;
             var cloned = node.clone();
-            if(!cloned)
-            {
-                console.warn("node type not found: " + node.type );
+            if (!cloned) {
+                console.warn("node type not found: " + node.type);
                 continue;
             }
             clipboard_info.nodes.push(cloned.serialize());
             if (node.inputs && node.inputs.length) {
                 for (var j = 0; j < node.inputs.length; ++j) {
                     var input = node.inputs[j];
-                    if (!input || input.link == null) {
+                    //this fork supports multiple incoming links per input, so
+                    //iterate input.links rather than the legacy scalar input.link
+                    if (!input || !input.links || input.links.length === 0) {
                         continue;
                     }
-                    var link_info = this.graph.links[input.link];
-                    if (!link_info) {
-                        continue;
+                    for (var k = 0; k < input.links.length; ++k) {
+                        var link_info = this.graph.links[input.links[k]];
+                        if (!link_info) {
+                            continue;
+                        }
+                        var origin_node = this.graph.getNodeById(link_info.origin_id);
+                        if (!origin_node) {
+                            continue;
+                        }
+                        clipboard_info.links.push([
+                            origin_node._relative_id,
+                            link_info.origin_slot,
+                            node._relative_id,
+                            link_info.target_slot,
+                            origin_node.id
+                        ]);
                     }
-                    var target_node = this.graph.getNodeById(
-                        link_info.origin_id
-                    );
-                    if (!target_node) {
-                        continue;
-                    }
-                    clipboard_info.links.push([
-                        target_node._relative_id,
-                        link_info.origin_slot, //j,
-                        node._relative_id,
-                        link_info.target_slot,
-                        target_node.id
-                    ]);
                 }
             }
         }
+
+        this.selected_groups.forEach(function(group) {
+            clipboard_info.groups.push(group.serialize());
+        });
+
         localStorage.setItem(
             "litegrapheditor_clipboard",
             JSON.stringify(clipboard_info)
@@ -7330,38 +7460,40 @@ LGraphNode.prototype.executeAction = function(action)
 
         //create nodes
         var clipboard_info = JSON.parse(data);
-        // calculate top-left node, could work without this processing but using diff with last node pos :: clipboard_info.nodes[clipboard_info.nodes.length-1].pos
+        var groups_info = clipboard_info.groups || [];
+
+        //compute top-left of the pasted block (nodes + groups) so every item
+        //keeps its relative layout once anchored at the mouse position
         var posMin = false;
-        var posMinIndexes = false;
+        var updatePosMin = function(x, y) {
+            if (!posMin) {
+                posMin = [x, y];
+            } else {
+                if (posMin[0] > x) posMin[0] = x;
+                if (posMin[1] > y) posMin[1] = y;
+            }
+        };
         for (var i = 0; i < clipboard_info.nodes.length; ++i) {
-            if (posMin){
-                if(posMin[0]>clipboard_info.nodes[i].pos[0]){
-                    posMin[0] = clipboard_info.nodes[i].pos[0];
-                    posMinIndexes[0] = i;
-                }
-                if(posMin[1]>clipboard_info.nodes[i].pos[1]){
-                    posMin[1] = clipboard_info.nodes[i].pos[1];
-                    posMinIndexes[1] = i;
-                }
-            }
-            else{
-                posMin = [clipboard_info.nodes[i].pos[0], clipboard_info.nodes[i].pos[1]];
-                posMinIndexes = [i, i];
-            }
+            updatePosMin(clipboard_info.nodes[i].pos[0], clipboard_info.nodes[i].pos[1]);
         }
+        for (var i = 0; i < groups_info.length; ++i) {
+            updatePosMin(groups_info[i].bounding[0], groups_info[i].bounding[1]);
+        }
+        if (!posMin) posMin = [this.graph_mouse[0], this.graph_mouse[1]];
+
+        var offsetX = this.graph_mouse[0] - posMin[0];
+        var offsetY = this.graph_mouse[1] - posMin[1];
+
         var nodes = [];
         for (var i = 0; i < clipboard_info.nodes.length; ++i) {
             var node_data = clipboard_info.nodes[i];
             var node = LiteGraph.createNode(node_data.type);
             if (node) {
                 node.configure(node_data);
-        
-				//paste in last known mouse position
-                node.pos[0] += this.graph_mouse[0] - posMin[0]; //+= 5;
-                node.pos[1] += this.graph_mouse[1] - posMin[1]; //+= 5;
-
-                this.graph.add(node,{doProcessChange:false});
-                
+                //paste in last known mouse position
+                node.pos[0] += offsetX;
+                node.pos[1] += offsetY;
+                this.graph.add(node, {doProcessChange: false});
                 nodes.push(node);
             }
         }
@@ -7386,7 +7518,28 @@ LGraphNode.prototype.executeAction = function(action)
 				console.warn("Warning, nodes missing on pasting");
         }
 
+        //create groups (offset their bounding like nodes)
+        var groups = [];
+        for (var i = 0; i < groups_info.length; ++i) {
+            var group_data = groups_info[i];
+            var group = new LiteGraph.LGraphGroup();
+            group.configure({
+                title: group_data.title,
+                bounding: [
+                    group_data.bounding[0] + offsetX,
+                    group_data.bounding[1] + offsetY,
+                    group_data.bounding[2],
+                    group_data.bounding[3]
+                ],
+                color: group_data.color,
+                font_size: group_data.font_size
+            });
+            this.graph.add(group);
+            groups.push(group);
+        }
+
         this.selectNodes(nodes);
+        this.selectGroups(groups);
 
 		this.graph.afterChange();
     };
@@ -7507,7 +7660,11 @@ LGraphNode.prototype.executeAction = function(action)
     };
 
     LGraphCanvas.prototype.processNodeSelected = function(node, e) {
-        this.selectNode(node, e && (e.shiftKey || e.ctrlKey || this.multi_select));
+        var add = !!(e && (e.shiftKey || e.ctrlKey || this.multi_select));
+        //clicking a node plainly (no modifier) should also drop any
+        //previously-selected groups, so selection stays mutually exclusive
+        if (!add) this.deselectAllGroups();
+        this.selectNode(node, add);
         if (this.onNodeSelected) {
             this.onNodeSelected(node);
         }
@@ -7642,6 +7799,50 @@ LGraphNode.prototype.executeAction = function(action)
     };
 
     /**
+     * selects several groups (or adds them to the current selection)
+     * Mirrors selectNodes so that rectangle selection can grab groups too,
+     * which is required for copy/paste of full groups-with-nodes blocks.
+     * @method selectGroups
+     **/
+    LGraphCanvas.prototype.selectGroups = function(groups, add_to_current_selection) {
+        if (!add_to_current_selection) {
+            this.deselectAllGroups();
+        }
+        if (!groups) return;
+        for (var i = 0; i < groups.length; ++i) {
+            var group = groups[i];
+            if (this.selected_groups.has(group)) {
+                this.deselectGroup(group);
+                continue;
+            }
+            group.is_selected = true;
+            this.selected_groups.add(group);
+        }
+        this.setDirty(true, true);
+    };
+
+    /**
+     * removes a group from the current selection
+     * @method deselectGroup
+     **/
+    LGraphCanvas.prototype.deselectGroup = function(group) {
+        if (!this.selected_groups.has(group)) return;
+        group.is_selected = false;
+        this.selected_groups.delete(group);
+    };
+
+    /**
+     * removes all groups from the current selection
+     * @method deselectAllGroups
+     **/
+    LGraphCanvas.prototype.deselectAllGroups = function() {
+        if (!this.graph) return;
+        this.selected_groups.forEach(function(g) { g.is_selected = false; });
+        this.selected_groups.clear();
+        this.setDirty(true, true);
+    };
+
+    /**
      * deletes all nodes in the current selection from the graph
      * @method deleteSelectedNodes
      **/
@@ -7670,13 +7871,71 @@ LGraphNode.prototype.executeAction = function(action)
 				this.onNodeDeselected(node);
 			}
         }
+        this.selected_groups.forEach(function(group) {
+            this.graph.remove(group);
+        }, this);
+        this.selected_groups.clear();
         this.selected_nodes = {};
         this.current_node = null;
         this.highlighted_links = {};
         this.setDirty(true);
 		this.graph.afterChange();
     };
-    
+
+    /**
+     * undo/redo — the graph.beforeChange() hook is already called at every
+     * mutating site (add, remove, connect, disconnect, paste, delete,
+     * drag-end...), we just serialize the graph into a stack on each call
+     * and restore it on demand.
+     **/
+    LGraphCanvas.prototype.saveSnapshot = function() {
+        if (!this.graph || this._suppress_undo) return;
+        //A logical operation (delete N nodes, paste M nodes, drag group...)
+        //may trigger beforeChange many times in rapid succession. Collapse
+        //bursts within 200ms into a single undoable step by keeping only
+        //the earliest snapshot of the burst (the true pre-state).
+        var now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+        if (this._last_snapshot_time && now - this._last_snapshot_time < 200) {
+            this._last_snapshot_time = now;
+            return;
+        }
+        this._last_snapshot_time = now;
+        this._undo_stack.push(JSON.stringify(this.graph.serialize()));
+        if (this._undo_stack.length > this._max_undo_stack) {
+            this._undo_stack.shift();
+        }
+        this._redo_stack.length = 0;
+    };
+
+    LGraphCanvas.prototype._restoreSnapshot = function(data) {
+        this._suppress_undo = true;
+        try {
+            this.graph.configure(data, false);
+        } finally {
+            this._suppress_undo = false;
+        }
+        //references to old nodes/groups are stale after configure
+        this.selected_nodes = {};
+        this.selected_group = null;
+        this.selected_groups.clear();
+        this.highlighted_links = {};
+        //reset the debounce window so the very next mutation snapshots cleanly
+        this._last_snapshot_time = 0;
+        this.setDirty(true, true);
+    };
+
+    LGraphCanvas.prototype.undo = function() {
+        if (!this._undo_stack.length || !this.graph) return;
+        this._redo_stack.push(JSON.stringify(this.graph.serialize()));
+        this._restoreSnapshot(JSON.parse(this._undo_stack.pop()));
+    };
+
+    LGraphCanvas.prototype.redo = function() {
+        if (!this._redo_stack.length || !this.graph) return;
+        this._undo_stack.push(JSON.stringify(this.graph.serialize()));
+        this._restoreSnapshot(JSON.parse(this._redo_stack.pop()));
+    };
+
     /**
      * centers the camera on a given node
      * @method centerOnNode
@@ -10361,6 +10620,16 @@ LGraphNode.prototype.executeAction = function(action)
             ctx.font = font_size + "px Arial";
 			ctx.textAlign = "left";
             ctx.fillText(group.title, pos[0] + 4, pos[1] + font_size);
+
+            if (group.is_selected) {
+                ctx.save();
+                ctx.globalAlpha = this.editor_alpha;
+                ctx.strokeStyle = "#FFF";
+                ctx.lineWidth = 2;
+                ctx.setLineDash([6, 4]);
+                ctx.strokeRect(pos[0] + 0.5, pos[1] + 0.5, size[0], size[1]);
+                ctx.restore();
+            }
         }
 
         ctx.restore();
@@ -13634,6 +13903,15 @@ LGraphNode.prototype.executeAction = function(action)
         return true;
     }
     LiteGraph.overlapBounding = overlapBounding;
+
+    //is 'inner' strictly contained in 'outer', format: [ startx, starty, width, height ]
+    function containsBounding(outer, inner) {
+        return outer[0] <= inner[0]
+            && outer[1] <= inner[1]
+            && outer[0] + outer[2] >= inner[0] + inner[2]
+            && outer[1] + outer[3] >= inner[1] + inner[3];
+    }
+    LiteGraph.containsBounding = containsBounding;
 
     //Convert a hex value to its decimal value - the inputted hex must be in the
     //	format of a hex triplet - the kind we use for HTML colours. The function
